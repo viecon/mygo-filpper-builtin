@@ -1,4 +1,3 @@
-#include "Arduino.h"
 #include "driver/i2s.h"
 #include "SD.h"
 #include "SPI.h"
@@ -6,13 +5,35 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <base64.h>
+#include <Stepper.h>
 
-const char* ssid = "SSID";
-const char* password = "PASSWORD";
-const char* apiKey = "API_KEY";
-// Google Gemini API endpoint
-const char* server = "generativelanguage.googleapis.com";
+const char *ssid = "WiFi Name";
+const char *password = "WiFi password";   // 用自己的熱點或用隊輔的
+const char *apiKey = "API_KEY";           // 要換成自己的
+const char *server = "generativelanguage.googleapis.com";
 const int port = 443;
+
+#define IN1 15
+#define IN2 13
+#define IN3 12
+#define IN4 14
+#define stepsPerRevolution 2048
+
+Stepper myStepper(stepsPerRevolution, IN1, IN3, IN2, IN4);
+
+int position[32] = { 0, -64, -128, -192, -256, -320, -384, -448, -512, -576, -640,
+                     -704, -768, -832, -896, -960, -1024, -1088, -1152, -1216, -1280, -1344, -1408,
+                     -1472, -1536, -1600, -1664, -1728, -1792, -1856, -1920, -1984 };
+int cur_pos = position[0]; // 記得改定位
+
+void move_to(int tar) {
+  tar--;
+  int diff = position[tar] - cur_pos;
+  if (diff > 0)
+    diff = diff - 2048;
+  myStepper.step(diff);
+  cur_pos = position[tar];
+}
 
 WiFiClientSecure client;
 
@@ -27,173 +48,22 @@ WiFiClientSecure client;
 #define BITS_PER_SAMPLE 16
 #define BUFFER_SIZE 64
 
+#define IR_PIN 27
+
 File audioFile;
 bool recording = false;
 int dataSize = 0;
-const char* audioPath = "/recording.wav";  // Modify if using SPIFFS or LittleFS
+const char *audioPath = "/recording.wav";
 const int chunkSize = 3000;
 
 long fileSize = 0;
 
-void getTranscribeInline() {
-  if (!client.connect(server, port)) {
-    Serial.println("Connection failed!");
-    return;
-  }
-  File file = SD.open(audioPath, "r");
-  if (!file) {
-    Serial.println("Failed to open file for chunked upload!");
-    return;
-  }
-  fileSize = file.size();
-  long bytesUploaded = 0;
-  uint8_t buffer[chunkSize];
-  String jsonLeft = "{ \"contents\": [ { \"parts\": [ { \"text\": \"Please convert the following speech to text and output it directly. If there is noise, you can ignore it. If it is all noise or unintelligible, please reply with &$%$hu#did\" }, { \"inline_data\": { \"mime_type\": \"audio/wav\", \"data\": \"";
-  String jsonRight = "\" } } ] } ] }";
-  String url = "/v1beta/models/gemini-2.0-flash:generateContent?key=" + String(apiKey);
-  Serial.print("Requesting URL: ");
-  Serial.println(url);
-
-  client.println("POST " + url + " HTTP/1.1");
-  client.println("Host: " + String(server));
-  client.println("Content-Type: application/json");
-  client.print("Content-Length: ");
-  client.println((fileSize + 2) / 3 * 4 + jsonLeft.length() + jsonRight.length());
-  client.println("Connection: close");
-  client.println();
-  client.print(jsonLeft);
-
-  //Serial.print(jsonLeft);
-  while (bytesUploaded < fileSize) {
-    size_t bytesToRead = min((long)chunkSize, fileSize - bytesUploaded);
-    String rawFileContent = "";
-    for (int i = 0; i < bytesToRead; i++) {
-      rawFileContent += char(file.read());
-    }
-    // size_t bytesRead = file.read(buffer, bytesToRead);
-    String encodedData = base64::encode(rawFileContent);
-    if (bytesToRead == 0) {
-      Serial.println("Failed to read chunk from file!");
-      file.close();
-      return;
-    }
-
-    client.print(encodedData);
-    // Serial.print(encodedData);
-    bytesUploaded += bytesToRead;
-    //Serial.printf("Uploaded %ld / %ld bytes\n", bytesUploaded, fileSize);
-  }
-  client.println(jsonRight);
-  //Serial.println(jsonRight);
-  String response = readResponse();
-  Serial.println(response);
-  parseJson(response);
-  client.stop();
-}
-
-String readResponse() {
-  String response = "";
-  long startTime = millis();
-
-  while (millis() - startTime < 10000) {  // Timeout after 5s
-    while (client.available()) {
-      char c = client.read();
-      response += c;
-
-      if (response.length() > 4096) {  // Prevent excessive memory use
-        Serial.println("Response too large! Truncating...");
-        return response;
-      }
-    }
-    if (response.length() > 0) break;
-  }
-
-  return response;
-}
-
-String parseJson(String response) {
-  // Find the start of the JSON body
-  int jsonStart = response.indexOf("{");
-  if (jsonStart == -1) {
-    Serial.println("Invalid JSON response.");
-    return "";
-  }
-
-  // Extract JSON content
-  String jsonData = response.substring(jsonStart);
-
-  // Parse JSON
-  StaticJsonDocument<1024> doc;
-  DeserializationError error = deserializeJson(doc, jsonData);
-
-  if (error) {
-    Serial.print("JSON Parsing failed: ");
-    Serial.println(error.f_str());
-    return "";
-  }
-
-  // Extract text fields
-  JsonArray candidates = doc["candidates"];
-  for (JsonObject candidate : candidates) {
-    JsonArray parts = candidate["content"]["parts"];
-    for (JsonObject part : parts) {
-      const char* text = part["text"];
-      if (text) {
-        Serial.println("Extracted Text: ");
-        Serial.println(text);
-        return text;
-      }
-    }
-  }
-  return "";
-}
-
-void writeWAVHeader(File file, int sampleRate, int bitsPerSample, int numChannels, int dataSize) {
-  file.seek(0);
-  file.write((byte*)&"RIFF", 4);
-  uint32_t fileSize = dataSize + 36;
-  file.write((byte*)&fileSize, 4);
-  file.write((byte*)&"WAVEfmt ", 8);
-  uint32_t subChunk1Size = 16;
-  uint16_t audioFormat = 1;
-  file.write((byte*)&subChunk1Size, 4);
-  file.write((byte*)&audioFormat, 2);
-  file.write((byte*)&numChannels, 2);
-  file.write((byte*)&sampleRate, 4);
-  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
-  file.write((byte*)&byteRate, 4);
-  uint16_t blockAlign = numChannels * bitsPerSample / 8;
-  file.write((byte*)&blockAlign, 2);
-  file.write((byte*)&bitsPerSample, 2);
-  file.write((byte*)&"data", 4);
-  file.write((byte*)&dataSize, 4);
-}
-
-void startRecording() {
-  audioFile = SD.open("/recording.wav", FILE_WRITE);
-  if (!audioFile) {
-    Serial.println("Failed to create file!");
-    return;
-  }
-  writeWAVHeader(audioFile, SAMPLE_RATE, BITS_PER_SAMPLE, 1, 0);
-  Serial.println("Recording started...");
-  recording = true;
-  dataSize = 0;
-}
-
-void stopRecording() {
-  if (recording) {
-    Serial.println("Recording finished!");
-    audioFile.seek(4);
-    fileSize = dataSize + 36;
-    audioFile.write((byte*)&fileSize, 4);
-    audioFile.seek(40);
-    audioFile.write((byte*)&dataSize, 4);
-    audioFile.close();
-    Serial.println("File saved!");
-    recording = false;
-  }
-}
+int getTranscribeInline();
+String readResponse();
+String parseJson(String response);
+void writeWAVHeader(File file, int sampleRate, int bitsPerSample, int numChannels, int dataSize);
+void startRecording();
+void stopRecording();
 
 void setup() {
   Serial.begin(115200);
@@ -235,29 +105,248 @@ void setup() {
   }
   Serial.println("\nConnected!");
 
-  // Set SSL/TLS certificate (skip if insecure)
   client.setInsecure();
+
+  myStepper.setSpeed(5);
+
+  pinMode(IR_PIN, INPUT);
+  while (digitalRead(IR_PIN) == HIGH) {
+    myStepper.step(-1);
+    delay(10);
+  }
+  myStepper.step(0);
 }
 
-int pre = LOW;
-int now = LOW;
+int pre = HIGH;
+int now = HIGH;
 
 void loop() {
   pre = now;
   now = digitalRead(BUTTON_PIN);
-  if (now == HIGH && pre == LOW && !recording) {
+  if (now == LOW && pre == HIGH && !recording) {
     startRecording();
-  } else if (now == LOW && pre == HIGH && recording) {
+  } else if (now == HIGH && pre == LOW && recording) {
     stopRecording();
     delay(1000);
-    getTranscribeInline();
+    int res = getTranscribeInline();
+    if (res != -1)
+      move_to(res);
   }
 
   if (recording) {
     int16_t sampleBuffer[BUFFER_SIZE];
     size_t bytesRead;
     i2s_read(I2S_NUM_0, sampleBuffer, BUFFER_SIZE * sizeof(int16_t), &bytesRead, portMAX_DELAY);
-    audioFile.write((byte*)sampleBuffer, bytesRead);
+    audioFile.write((byte *)sampleBuffer, bytesRead);
     dataSize += bytesRead;
+  }
+}
+
+int getTranscribeInline() {
+  if (!client.connect(server, port)) {
+    Serial.println("Connection failed!");
+    return -1;
+  }
+  File file = SD.open(audioPath, "r");
+  if (!file) {
+    Serial.println("Failed to open file for chunked upload!");
+    return -1;
+  }
+  fileSize = file.size();
+  long bytesUploaded = 0;
+  uint8_t buffer[chunkSize];
+
+  String prompt = R"rawliteral(
+你現在是一本 **「答案之書」**，你的回答方式會完全採用下列提供的 **句子清單** 中的語句。
+
+你的任務如下：
+
+1. **讀取音檔，並理解我說的話或提問的內容。**
+2. **根據對話內容，從以下提供的句子中選擇最符合情境的一句。**
+3. **直接回傳所選語句對應的編號，不需要回覆其他文字或解釋。**
+
+---
+
+**以下是你可以選擇的句子：**
+
+1. 加入交大創客俱樂部
+2. 這時就該吃點東西
+3. 這很顯然吧
+4. 去問你媽
+5. 聽不懂。
+6. 是又怎樣
+7. 你會怕？
+8. 我很感動
+9. 益友，可以有
+10. 迷霧之中會有路徑顯現
+11. 看似無盡黑暗才是真正轉機
+12. 此路不通！
+13. 欲速則不達
+14. 燒肉
+15. 怎麼想怎麼賺
+16. AI不是萬能的
+17. 錢包會哭喔
+18. 你說得對
+19. 不如原神
+20. 好啊哪次不好
+21. 要不你再想一下？
+22. 這根本情緒勒索
+23. 孩子，去讀書
+24. 重點 要活著
+25. 寶，去睡覺
+26. 食之無味 棄之可惜
+27. 因為春日影是一首好歌
+28. 對健康不好喔
+29. 拜拜 下次見
+30. 早中晚 安
+31. 這根本算犯罪
+32. 看看過程的風景
+
+---
+
+**舉例說明：**
+如果我說「我肚子好餓」，你應該選擇回覆「2」——這時就該吃點東西。
+如果我說「我今天失敗了」，你可以選擇「11」——看似無盡黑暗才是真正轉機。
+
+有時候你也可以選擇最具幽默感或反諷效果的句子作為回應，但要確保回應與語意有合理關聯。
+只需回傳數字（句子的編號），不要附加任何其他文字。
+
+---
+
+請依照此格式開始執行。
+  )rawliteral";
+  String jsonLeft = "{ \"contents\": [ { \"parts\": [ { \"text\": \"" + prompt + "\" }, { \"inline_data\": { \"mime_type\": \"audio/wav\", \"data\": \"";
+  String jsonRight = "\" } } ] } ] }";
+  String url = "/v1beta/models/gemini-2.0-flash:generateContent?key=" + String(apiKey);
+  Serial.print("Requesting URL: ");
+  Serial.println(url);
+
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: " + String(server));
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println((fileSize + 2) / 3 * 4 + jsonLeft.length() + jsonRight.length());
+  client.println("Connection: close");
+  client.println();
+
+  client.print(jsonLeft);
+  while (bytesUploaded < fileSize) {
+    size_t bytesToRead = min((long)chunkSize, fileSize - bytesUploaded);
+    String rawFileContent = "";
+    for (int i = 0; i < bytesToRead; i++) {
+      rawFileContent += char(file.read());
+    }
+    String encodedData = base64::encode(rawFileContent);
+    if (bytesToRead == 0) {
+      Serial.println("Failed to read chunk from file!");
+      file.close();
+      return -1;
+    }
+
+    client.print(encodedData);
+    bytesUploaded += bytesToRead;
+  }
+  client.println(jsonRight);
+
+  String response = readResponse();
+  Serial.println(response);
+  int chosen_num = parseJson(response).toInt();
+  client.stop();
+  return chosen_num;
+}
+
+String readResponse() {
+  String response = "";
+  long startTime = millis();
+
+  while (millis() - startTime < 10000) {  // timeout after 10s
+    while (client.available()) {
+      char c = client.read();
+      response += c;
+    }
+    if (response.length() > 0)
+      break;
+  }
+
+  return response;
+}
+
+String parseJson(String response) {
+  int jsonStart = response.indexOf("{");
+  if (jsonStart == -1) {
+    Serial.println("Invalid JSON response.");
+    return "";
+  }
+
+  String jsonData = response.substring(jsonStart);
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, jsonData);
+
+  if (error) {
+    Serial.print("JSON Parsing failed: ");
+    Serial.println(error.f_str());
+    return "";
+  }
+
+  JsonArray candidates = doc["candidates"];
+  for (JsonObject candidate : candidates) {
+    JsonArray parts = candidate["content"]["parts"];
+    for (JsonObject part : parts) {
+      const char *text = part["text"];
+      if (text) {
+        Serial.println("Extracted Text: ");
+        Serial.println(text);
+        return text;
+      }
+    }
+  }
+  return "";
+}
+
+void writeWAVHeader(File file, int sampleRate, int bitsPerSample, int numChannels, int dataSize) {
+  file.seek(0);
+  file.write((byte *)&"RIFF", 4);
+  uint32_t fileSize = dataSize + 36;
+  file.write((byte *)&fileSize, 4);
+  file.write((byte *)&"WAVEfmt ", 8);
+  uint32_t subChunk1Size = 16;
+  uint16_t audioFormat = 1;
+  file.write((byte *)&subChunk1Size, 4);
+  file.write((byte *)&audioFormat, 2);
+  file.write((byte *)&numChannels, 2);
+  file.write((byte *)&sampleRate, 4);
+  uint32_t byteRate = sampleRate * numChannels * bitsPerSample / 8;
+  file.write((byte *)&byteRate, 4);
+  uint16_t blockAlign = numChannels * bitsPerSample / 8;
+  file.write((byte *)&blockAlign, 2);
+  file.write((byte *)&bitsPerSample, 2);
+  file.write((byte *)&"data", 4);
+  file.write((byte *)&dataSize, 4);
+}
+
+void startRecording() {
+  audioFile = SD.open("/recording.wav", FILE_WRITE);
+  if (!audioFile) {
+    Serial.println("Failed to create file!");
+    return;
+  }
+  writeWAVHeader(audioFile, SAMPLE_RATE, BITS_PER_SAMPLE, 1, 0);
+  Serial.println("Recording started...");
+  recording = true;
+  dataSize = 0;
+}
+
+void stopRecording() {
+  if (recording) {
+    Serial.println("Recording finished!");
+    audioFile.seek(4);
+    fileSize = dataSize + 36;
+    audioFile.write((byte *)&fileSize, 4);
+    audioFile.seek(40);
+    audioFile.write((byte *)&dataSize, 4);
+    audioFile.close();
+    Serial.println("File saved!");
+    recording = false;
   }
 }
